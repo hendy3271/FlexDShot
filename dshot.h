@@ -6,13 +6,16 @@ enum DShotType {
   DShot600,
   DShot1200,
   DShotType_Count,
+  DShotType_Invalid = 254,
+  DShotType_Error = 255
 };
 
 enum DShotError {
   DShotError_Success,
+  DShotError_Error,
   DShotError_NotAPin,
   DShotError_NotFlexPWM,
-  DShotError_SubmoduleUsed,
+  DShotError_ChannelUsed,
   DShotError_NoSource,
   DShotError_NoDMAAvailable,
   DShotError_Count
