@@ -360,7 +360,7 @@ int sendDSHOT(uint8_t pin, uint16_t throttle, bool telemetry) {
   if (((dma_pins >> pin) & 1) == 0) {
     int error = dshotInit(pin);
     if (error > 0) return error;
-    dma_pins |= 1 << pin;
+    dma_pins |= 1ULL << pin;  // 64-bit shift: pins >= 32 exist on Teensy 4.1 / MicroMod
   }
 
   //Serial.printf("sendDSHOT, pin %d, throttle %d, telemetry %c\n", pin, throttle, telemetry ? 'T' : 'F');
@@ -384,6 +384,15 @@ int sendDSHOT(uint8_t pin, uint16_t throttle, bool telemetry) {
 
     uint32_t bit_length = flexpwm->SM[submodule].VAL1;
 
+    // Wait for any previous frame on this pin to finish before touching its buffer
+    const uint64_t pin_bit = 1ULL << pin;
+    elapsedMicros waited;
+    while ((busy_pins & pin_bit) && waited < BUSY_TIMEOUT_US) {}
+    if (busy_pins & pin_bit) {  // ISR never fired: stop the submodule and recover
+      flexpwm->MCTRL &= ~FLEXPWM_MCTRL_RUN(1 << submodule);
+      busy_pins &= ~pin_bit;
+    }
+
     if (info->channel == 0) {  // X : inverted need to zero because we will flip later.
       for (int i = 0; i < DATA_LENGTH; i++) {
         dma_data[pin][i] = 0;
@@ -392,7 +401,7 @@ int sendDSHOT(uint8_t pin, uint16_t throttle, bool telemetry) {
 
     for (int i = 0; i < 16; i++) {
       uint32_t offset = (data >> i) & 1;
-      dma_data[pin][18 - i - 1] = (bit_length * 3) >> (3 - offset);  // Divide by 4 if 0 bit and 8 if 1 bit
+      dma_data[pin][18 - i - 1] = (bit_length * 3) >> (3 - offset);  // High time: 3/8 (37.5%) for a 0 bit, 3/4 (75%) for a 1 bit
     }
 
     if (info->channel == 0) {  // X : inverted
@@ -411,6 +420,14 @@ int sendDSHOT(uint8_t pin, uint16_t throttle, bool telemetry) {
     Serial.println("]");
     */
 
+    // Restart the DMA from the start of the buffer and the counter from INIT so the frame begins cleanly
+    dma_channels[pin]->sourceBuffer(dma_data[pin], sizeof(dma_data[pin]));
+    flexpwm->SM[submodule].CTRL2 |= FLEXPWM_SMCTRL2_FRCEN;
+    flexpwm->SM[submodule].CTRL2 |= FLEXPWM_SMCTRL2_FORCE;
+
+    // TODO(LDOK): LDOK is only set once in flexpwmFrequency(). Verify on a scope that each DMA write to
+    // VALx is loaded every PWM period (FlexPWM VALDE DMA) without re-setting LDOK; not changed here.
+    busy_pins |= pin_bit;
     flexpwm->MCTRL |= FLEXPWM_MCTRL_RUN(1 << submodule);
 
     return DShotError_Success;
@@ -437,6 +454,8 @@ static void ISR() {
     default: flexpwm = &IMXRT_FLEXPWM4;
   }
 
-  flexpwm->MCTRL &= FLEXPWM_MCTRL_RUN(~(1 << submodule));
+  flexpwm->MCTRL &= ~FLEXPWM_MCTRL_RUN(1 << submodule);  // Clear only this submodule's RUN bit
   dma_channels[pin]->clearInterrupt();
+  busy_pins &= ~(1ULL << pin);
+  asm("DSB");
 }
