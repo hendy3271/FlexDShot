@@ -57,9 +57,11 @@ void loop() {
     while (Serial.available()) Serial.read();
   }
 
-  // Move the throttle towards the target
+  /*// Move the throttle towards the target
   if (throttle < throttle_target) throttle++;
   if (throttle > throttle_target) throttle--;
+  */
+  throttle = throttle_target;
 
   // Send new throttles
   for (unsigned int i = 0; i < pin_number; i++) {
