@@ -1,6 +1,6 @@
 # FlexDShot
 
-An Arduino library for **Teensy 4.0 / 4.1** (NXP i.MX RT1062) that sends **DShot** throttle frames to ESCs using the chip's **FlexPWM** hardware and **DMA**.
+An Arduino library for **Teensy 4.0 / 4.1 / MicroMod** (NXP i.MX RT1062) that sends **DShot** throttle frames to ESCs using the chip's **FlexPWM** hardware and **DMA**.
 
 Each frame is produced in hardware: the library fills a small buffer with one PWM duty value per bit and a DMA channel writes those values into the FlexPWM compare register on every PWM period. The CPU only builds the 16-bit frame; it does not bit-bang the output.
 
@@ -21,7 +21,7 @@ Each frame is produced in hardware: the library fills a small buffer with one PW
 |---|---|
 | Teensy 4.0 | Supported |
 | Teensy 4.1 | Supported |
-| Teensy MicroMod | Pin table exists in the source, but no DMA interrupt table is defined, so it does not currently build for MicroMod |
+| Teensy MicroMod | Builds; FlexPWM pins 34–39 match the Teensy 4.0 column below (not hardware-tested) |
 | Anything else | Not supported (`#error` at compile time) |
 
 ## Which pins work
@@ -51,8 +51,6 @@ That gives up to 12 independent DShot outputs on a Teensy 4.0 and 14 on a Teensy
 A good four-motor set is pins **2, 4, 5, 6** or **3, 4, 5, 6** (used by the example).
 
 Because DShot takes over a pin's FlexPWM submodule, don't use `analogWrite()` on any other pin that shares that submodule.
-
-> Known issue: on Teensy 4.1, pins 32 and above are not tracked correctly yet (see *Limitations*).
 
 ## Installation
 
@@ -128,7 +126,7 @@ Returns the current bit rate in bits/s. Default is DShot150 (150000).
 
 ### `int sendDSHOT(uint8_t pin, uint16_t throttle = 0, bool telemetry = false)`
 
-Sends one DShot frame on `pin`. The first call for a pin configures its FlexPWM submodule and a DMA channel.
+Sends one DShot frame on `pin`. The first call for a pin configures its FlexPWM submodule and a DMA channel. If the previous frame on that pin is still going out, the call waits for it to finish (up to 1 ms) before starting the new one.
 
 - `throttle`: 0–2047, clamped to `DSHOT_THROTTLE_MAX` (2047). By the DShot convention, 0 is disarmed/stop, 1–47 are ESC commands, and 48–2047 is throttle. The library sends the value as-is; it doesn't treat commands specially.
 - `telemetry`: sets the telemetry-request bit in the frame. The library doesn't read the reply.
@@ -137,12 +135,12 @@ Returns a `DShotError` value:
 
 | Value | Meaning |
 |---|---|
-| `DShotError_Success` | Frame queued |
+| `DShotError_Success` | Frame started |
 | `DShotError_NotAPin` | Pin number out of range |
 | `DShotError_NotFlexPWM` | Pin isn't a FlexPWM pin (e.g. a QuadTimer pin) |
 | `DShotError_SubmoduleUsed` | Another pin already uses this FlexPWM submodule |
 | `DShotError_NoSource` | No DMA request source for this submodule |
-| `DShotError_NoDMAAvailable` | Couldn't get a DMA channel |
+| `DShotError_NoDMAAvailable` | Couldn't get a DMA channel (nothing is claimed, so you can retry later) |
 
 ### Constants
 
@@ -162,9 +160,7 @@ Returns a `DShotError` value:
 - One DShot speed for all pins, fixed after the first send. There's no way to release a pin.
 - One pin per FlexPWM submodule; QuadTimer pins aren't supported.
 - No helper for DShot commands (beeps, spin direction, save settings, …). You can send the raw command value, but you must repeat it yourself and set the telemetry bit where the ESC firmware needs it.
-- Teensy 4.1 pins ≥ 32 aren't tracked correctly yet, so calling `sendDSHOT()` again on those pins fails.
-- Teensy MicroMod doesn't build yet.
-- Calling `sendDSHOT()` again before the last frame has finished overwrites the buffer mid-frame. Leave at least one frame time between calls (about 107 µs at DShot150, 27 µs at DShot600).
+- `sendDSHOT()` blocks briefly if the previous frame on the same pin hasn't finished (a frame takes about 133 µs at DShot150 and 33 µs at DShot600).
 
 ## License
 
