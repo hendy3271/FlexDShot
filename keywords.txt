@@ -1,11 +1,13 @@
 #######################################
-# Syntax Coloring Map For MadgwickAHRS
+# Syntax Coloring Map For FlexDShot
 #######################################
 
 #######################################
 # Datatypes (KEYWORD1)
 #######################################
 
+DShotType	KEYWORD1
+DShotError	KEYWORD1
 
 #######################################
 # Methods and Functions (KEYWORD2)
@@ -18,16 +20,20 @@ sendDSHOT	KEYWORD2
 # Constants (LITERAL1)
 #######################################
 
-DShotError_Success LITERAL1
-DShotError_NotAPin LITERAL1
-DShotError_NotFlexPWM LITERAL1
-DShotError_SubmoduleUsed LITERAL1
-DShotError_NoSource LITERAL1
-DShotError_NoDMAAvailable LITERAL1
-DShotError_Count LITERAL1
+DShotError_Success	LITERAL1
+DShotError_Error	LITERAL1
+DShotError_NotAPin	LITERAL1
+DShotError_NotFlexPWM	LITERAL1
+DShotError_ChannelUsed	LITERAL1
+DShotError_NoSource	LITERAL1
+DShotError_NoDMAAvailable	LITERAL1
+DShotError_Count	LITERAL1
 
-DShot150 LITERAL1
-DShot300 LITERAL1
-DShot600 LITERAL1
-DShot1200 LITERAL1
-DShotType_Count LITERAL1
+DShot150	LITERAL1
+DShot300	LITERAL1
+DShot600	LITERAL1
+DShot1200	LITERAL1
+DShotType_Count	LITERAL1
+DShotType_Invalid	LITERAL1
+DShotType_Error	LITERAL1
+DSHOT_THROTTLE_MAX	LITERAL1

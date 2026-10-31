@@ -12,7 +12,7 @@ void setup() {
     Serial.print("Pin Number ");
     Serial.print(pins[i]);
     Serial.print(" : ");
-    switch (sendDSHOT(pins[0], 0, false)) {
+    switch (sendDSHOT(pins[i], 0, false)) {
       case DShotError_Success:
         Serial.println("SUCCESS!");
         break;
@@ -22,14 +22,17 @@ void setup() {
       case DShotError_NotFlexPWM:
         Serial.println("FAILED -> This pin is not a FlexPWM pin!");
         break;
-      case DShotError_SubmoduleUsed:
-        Serial.println("FAILED -> Submodule already in use!");
+      case DShotError_ChannelUsed:
+        Serial.println("FAILED -> FlexPWM channel already in use by another pin!");
         break;
       case DShotError_NoSource:
         Serial.println("FAILED -> Unknown DMA Source!");
         break;
       case DShotError_NoDMAAvailable:
         Serial.println("FAILED -> No more DMA channels available!");
+        break;
+      case DShotError_Error:
+        Serial.println("FAILED -> Internal error!");
         break;
       default:
         Serial.println("FAILED -> Unknown error!");
@@ -48,12 +51,15 @@ void setup() {
 }
 
 void loop() {
-  static uint16_t throttle = 47;
-  static uint16_t throttle_target = 47;
+  // DShot values 1-47 are ESC commands, not throttle: only send 0 (stop) or 48-2047.
+  const uint16_t THROTTLE_MIN = 48;
+  static uint16_t throttle = THROTTLE_MIN;
+  static uint16_t throttle_target = THROTTLE_MIN;
 
   // Read the throttle
   if (Serial.available()) {
-    throttle_target = constrain((uint16_t)Serial.parseInt(), 0, DSHOT_THROTTLE_MAX);
+    long value = Serial.parseInt();
+    throttle_target = (value <= 0) ? 0 : constrain(value, THROTTLE_MIN, DSHOT_THROTTLE_MAX);
     while (Serial.available()) Serial.read();
   }
 
@@ -61,7 +67,7 @@ void loop() {
   if (throttle < throttle_target) throttle++;
   if (throttle > throttle_target) throttle--;
   */
-  throttle = throttle_target;
+  throttle = throttle_target;  // throttle_target is always 0 (stop) or 48-2047, never a command value
 
   // Send new throttles
   for (unsigned int i = 0; i < pin_number; i++) {

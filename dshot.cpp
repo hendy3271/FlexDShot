@@ -2,10 +2,10 @@
 #include "DMAChannel.h"
 
 #ifndef __IMXRT1062__
-#error THIS MODULE ONLY WORKS WITH TEENSY 4.0 AND 4.1
+#error THIS MODULE ONLY WORKS WITH TEENSY 4.0, 4.1 AND MICROMOD
 #endif
 
-void flexpwmFrequency(IMXRT_FLEXPWM_t *p, unsigned int submodule, uint8_t channel, float frequency);
+static void flexpwmFrequency(IMXRT_FLEXPWM_t *p, unsigned int submodule, unsigned int sm_index, float frequency);
 
 template<uint8_t submodule_number> static void ISR();
 
@@ -16,7 +16,7 @@ template<uint8_t submodule_number> static void ISR();
 
 struct pwm_pin_info_struct {
   uint8_t type;     // 0=no pwm, 1=flexpwm, 2=quad
-  uint8_t flex_module;   // 0-3, 0-3
+  uint8_t flex_module;   // Submodule index _M(module, submodule): 0-15
   uint8_t channel;  // 0=X, 1=A, 2=B
   uint8_t muxval;   //
 };
@@ -33,7 +33,7 @@ struct pwm_pin_info_struct {
 
 #if defined(__IMXRT1062__)
 
-const struct pwm_pin_info_struct pwm_pin_info[] = {
+static const struct pwm_pin_info_struct pwm_pin_info[] = {
   { 1, _M(1, 1), 0, 4 },  // FlexPWM1_1_X   0  // AD_B0_03
   { 1, _M(1, 0), 0, 4 },  // FlexPWM1_0_X   1  // AD_B0_02
   { 1, _M(4, 2), 1, 1 },  // FlexPWM4_2_A   2  // EMC_04
@@ -155,26 +155,30 @@ const struct pwm_pin_info_struct pwm_pin_info[] = {
 
 // End direct copy of pwm.c
 
-void (*dma_isr[FLEXPWM_SUBMODULE_NUMBER])() = { ISR<0>, ISR<1>, ISR<2>, ISR<3>, ISR<4>, ISR<5>, ISR<6>, ISR<7>, ISR<8>, ISR<9>,
-                                        ISR<10>, ISR<11>, ISR<12>, ISR<13>, ISR<14>, ISR<15> };
+static void (*const dma_isr[FLEXPWM_SUBMODULE_NUMBER])() = { ISR<0>, ISR<1>, ISR<2>, ISR<3>, ISR<4>, ISR<5>, ISR<6>, ISR<7>,
+                                                             ISR<8>, ISR<9>, ISR<10>, ISR<11>, ISR<12>, ISR<13>, ISR<14>, ISR<15> };
 
-const uint16_t dshotFreq[DShotType_Count] = { 150, 300, 600, 1200 };
+static const float dshotFreq[DShotType_Count] = { 150'000, 300'000, 600'000, 1'200'000 };  // bits/s
 
-const uint16_t DATA_LENGTH = 20;
+static const uint16_t DATA_LENGTH = 20;              // 2 idle bits + 16 data bits + 2 idle bits
+static const uint32_t BUSY_TIMEOUT_US = 1000;        // Longest frame (DShot150, 20 bits) is ~133us
 
+// One DMA "minor loop" per PWM period: rewrites VAL0..VAL5 of a submodule in register order
+// (must match IMXRT_FLEXPWM_t::SM[] layout starting at VAL0).
 struct flexpwm_buffer {
-    uint16_t VAL0 = 0;      // Mid-cycle reload (if used)
-    uint16_t VAL1 = 0;      // Period
-    uint16_t FRACVAL2 = 0;  // PWMA fractional
-    uint16_t VAL2 = 0;      // PWMA rising edge
-    uint16_t FRACVAL3 = 0;
-    uint16_t VAL3 = 0;      // PWMA falling edge
-    uint16_t FRACVAL4 = 0;
-    uint16_t VAL4 = 0;      // PWMB rising
-    uint16_t FRACVAL5 = 0;
-    uint16_t VAL5 = 0;      // PWMB falling
-    uint16_t FRACVAL1 = 0;  // If needed
+  uint16_t VAL0 = 0;      // PWMX turn-on (X is high from VAL0 to VAL1)
+  uint16_t FRACVAL1 = 0;
+  uint16_t VAL1 = 0;      // Period
+  uint16_t FRACVAL2 = 0;
+  uint16_t VAL2 = 0;      // PWMA rising edge
+  uint16_t FRACVAL3 = 0;
+  uint16_t VAL3 = 0;      // PWMA falling edge
+  uint16_t FRACVAL4 = 0;
+  uint16_t VAL4 = 0;      // PWMB rising edge
+  uint16_t FRACVAL5 = 0;
+  uint16_t VAL5 = 0;      // PWMB falling edge
 };
+static_assert(sizeof(flexpwm_buffer) == 22, "flexpwm_buffer must mirror VAL0..VAL5 registers");
 
 struct flexpwm_submodule_pins {
   uint8_t pinX = 255;  // X
@@ -182,262 +186,207 @@ struct flexpwm_submodule_pins {
   uint8_t pinB = 255;  // B
 };
 
-DMAChannel *dma_channels[FLEXPWM_SUBMODULE_NUMBER] = { nullptr };
-flexpwm_buffer dma_data[FLEXPWM_SUBMODULE_NUMBER][DATA_LENGTH] = {};
-flexpwm_submodule_pins submodule_pins[FLEXPWM_SUBMODULE_NUMBER] = {};
+// All per-submodule arrays are indexed by _M(module, submodule) (0-15)
+static DMAChannel *dma_channels[FLEXPWM_SUBMODULE_NUMBER] = { nullptr };
+static flexpwm_buffer dma_data[FLEXPWM_SUBMODULE_NUMBER][DATA_LENGTH] = {};
+static flexpwm_submodule_pins submodule_pins[FLEXPWM_SUBMODULE_NUMBER] = {};
 
-float dshot_freq = dshotFreq[DShot150];
-uint64_t dma_pins = 0;            // "Bit array" for pin tracking
-uint16_t flexpwm_submodules = 0;  // "Bit array" for submodule tracking M(flex_module, submodule)
+static float dshot_freq = dshotFreq[DShot150];
+static uint64_t dma_pins = 0;                  // "Bit array" for pin tracking (1ULL << pin)
+static uint16_t flexpwm_submodules = 0;        // "Bit array" for submodule tracking M(flex_module, submodule)
+static volatile uint16_t busy_submodules = 0;  // "Bit array" of submodules with a frame in flight (cleared in ISR)
 
-uint16_t dshotFrequency() {
-  //Serial.println("dshotFrequency()");
+static const uint8_t dma_sources[FLEXPWM_SUBMODULE_NUMBER] = {
+  DMAMUX_SOURCE_FLEXPWM1_WRITE0, DMAMUX_SOURCE_FLEXPWM1_WRITE1, DMAMUX_SOURCE_FLEXPWM1_WRITE2, DMAMUX_SOURCE_FLEXPWM1_WRITE3,
+  DMAMUX_SOURCE_FLEXPWM2_WRITE0, DMAMUX_SOURCE_FLEXPWM2_WRITE1, DMAMUX_SOURCE_FLEXPWM2_WRITE2, DMAMUX_SOURCE_FLEXPWM2_WRITE3,
+  DMAMUX_SOURCE_FLEXPWM3_WRITE0, DMAMUX_SOURCE_FLEXPWM3_WRITE1, DMAMUX_SOURCE_FLEXPWM3_WRITE2, DMAMUX_SOURCE_FLEXPWM3_WRITE3,
+  DMAMUX_SOURCE_FLEXPWM4_WRITE0, DMAMUX_SOURCE_FLEXPWM4_WRITE1, DMAMUX_SOURCE_FLEXPWM4_WRITE2, DMAMUX_SOURCE_FLEXPWM4_WRITE3,
+};
+
+static inline IMXRT_FLEXPWM_t *flexpwmModule(unsigned int flex_module) {  // flex_module is 1-4
+  return flex_module == 1 ? &IMXRT_FLEXPWM1 : flex_module == 2 ? &IMXRT_FLEXPWM2
+                                            : flex_module == 3 ? &IMXRT_FLEXPWM3
+                                                               : &IMXRT_FLEXPWM4;
+}
+
+float dshotFrequency() {
   return dshot_freq;
 }
 
-uint16_t dshotFrequency(uint8_t dshot_speed) {
-  //Serial.println("dshotFrequency()");
-  if (dshot_speed >= DShotType_Count) return DShotType_Invalid;  // Return an error if there is not compatable mode
-  if (dma_pins > 0) return DShotType_Error;                      // Return and error if any pin is initialized TODO : uninitialization
+float dshotFrequency(uint8_t dshot_speed) {
+  if (dshot_speed >= DShotType_Count) return -1.0f;  // Not a DShot speed
+  if (dma_pins > 0) return -2.0f;                    // A pin is already initialized TODO : uninitialization
   dshot_freq = dshotFreq[dshot_speed];
   return dshot_freq;
 }
 
-// Inspired by pwm.c : void analogWriteFrequency(uint8_t pin, float frequency)
-int dshotInit(uint8_t pin)  // Returns whether the pin is DShot capable (ie FlexPWM)
-{
-  //Serial.println("dshotInit()");
-  const struct pwm_pin_info_struct *info;
+// Point the DMA at the start of the submodule's buffer: one 22-byte minor loop (VAL0..VAL5) per PWM reload,
+// destination rewinds by 22 bytes after each minor loop, DATA_LENGTH minor loops per frame.
+static void dmaReset(unsigned int sm_index) {
+  const unsigned int submodule = _SM(sm_index);
+  IMXRT_FLEXPWM_t *flexpwm = flexpwmModule(_FM(sm_index));
+  volatile auto *tcd = dma_channels[sm_index]->TCD;
+  const int32_t minor = sizeof(flexpwm_buffer);
 
+  tcd->SADDR = dma_data[sm_index];
+  tcd->SOFF = 2;
+  tcd->ATTR = DMA_TCD_ATTR_SSIZE(1) | DMA_TCD_ATTR_DSIZE(1);
+  tcd->NBYTES_MLOFFYES = DMA_TCD_NBYTES_DMLOE | DMA_TCD_NBYTES_MLOFFYES_MLOFF(-minor) | DMA_TCD_NBYTES_MLOFFYES_NBYTES(minor);
+  tcd->SLAST = -(int32_t)sizeof(dma_data[sm_index]);
+  tcd->DADDR = &flexpwm->SM[submodule].VAL0;
+  tcd->DOFF = 2;
+  tcd->DLASTSGA = 0;
+  tcd->CITER = DATA_LENGTH;
+  tcd->BITER = DATA_LENGTH;
+}
+
+// Inspired by pwm.c : void analogWriteFrequency(uint8_t pin, float frequency)
+static int dshotInit(uint8_t pin)  // Returns whether the pin is DShot capable (ie FlexPWM)
+{
   if (pin >= CORE_NUM_DIGITAL) return DShotError_NotAPin;  // Not even a pin!
 
-  //Serial.printf("analogWriteFrequency, pin %d, freq %d\n", pin, (int)frequency);
-  info = pwm_pin_info[pin];
+  const struct pwm_pin_info_struct *info = &pwm_pin_info[pin];
+  if (info->type != 1) return DShotError_NotFlexPWM;  // Not DShot capable (QuadTimer / no PWM)
 
-  if (info->type == 1) {
-    // FlexPWM pin
-    
-    unsigned int submodule = _SM(info->flex_module);
-    unsigned int flex_module = _FM(info->flex_module);
-    uint16_t mask = 1 << submodule;
+  const unsigned int sm_index = info->flex_module;
+  const unsigned int submodule = _SM(sm_index);
+  const unsigned int flex_module = _FM(sm_index);
+  const uint16_t mask = 1 << submodule;
+  IMXRT_FLEXPWM_t *flexpwm = flexpwmModule(flex_module);
 
-    IMXRT_FLEXPWM_t *flexpwm = nullptr;
+  // Check the channel first so a failure leaves nothing half-configured
+  uint8_t *channel_pin = info->channel == 0 ? &submodule_pins[sm_index].pinX
+                       : info->channel == 1 ? &submodule_pins[sm_index].pinA
+                                            : &submodule_pins[sm_index].pinB;
+  if (*channel_pin != 255) return DShotError_ChannelUsed;  // Channel already used by another pin
 
-    if ((flexpwm_submodules & M(flex_module, submodule)) == 0) { 
-      // Submodule not yet used, need to configure
-      flexpwm_submodules |= M(flex_module, submodule);
+  if ((flexpwm_submodules & M(flex_module, submodule)) == 0) {
+    // Submodule not yet used, need to configure (one DMA channel per submodule, shared by X/A/B)
+    if (sm_index >= FLEXPWM_SUBMODULE_NUMBER) return DShotError_NoSource;  // Doesn't match a known DMA source
 
-      if constexpr (flex_module == 1) flexpwm = &IMXRT_FLEXPWM1;
-      else if constexpr (flex_module == 2) flexpwm = &IMXRT_FLEXPWM2;
-      else if constexpr (flex_module == 3) flexpwm = &IMXRT_FLEXPWM3;
-      else if constexpr (flex_module == 4) flexpwm = &IMXRT_FLEXPWM4;
-      else return DShotError_Error;  // Invalid module, should never happen
-
-      flexpwmFrequency(flexpwm, submodule, info->channel, dshot_freq);
-
-      // Configure DMA
-      unsigned int dma_source = 255;
-      switch (info->flex_module) {
-        case M(1, 0):
-          dma_source = DMAMUX_SOURCE_FLEXPWM1_WRITE0;
-          break;
-        case M(1, 1):
-          dma_source = DMAMUX_SOURCE_FLEXPWM1_WRITE1;
-          break;
-        case M(1, 2):
-          dma_source = DMAMUX_SOURCE_FLEXPWM1_WRITE2;
-          break;
-        case M(1, 3):
-          dma_source = DMAMUX_SOURCE_FLEXPWM1_WRITE3;
-          break;
-        case M(2, 0):
-          dma_source = DMAMUX_SOURCE_FLEXPWM2_WRITE0;
-          break;
-        case M(2, 1):
-          dma_source = DMAMUX_SOURCE_FLEXPWM2_WRITE1;
-          break;
-        case M(2, 2):
-          dma_source = DMAMUX_SOURCE_FLEXPWM2_WRITE2;
-          break;
-        case M(2, 3):
-          dma_source = DMAMUX_SOURCE_FLEXPWM2_WRITE3;
-          break;
-        case M(3, 0):
-          dma_source = DMAMUX_SOURCE_FLEXPWM3_WRITE0;
-          break;
-        case M(3, 1):
-          dma_source = DMAMUX_SOURCE_FLEXPWM3_WRITE1;
-          break;
-        case M(3, 2):
-          dma_source = DMAMUX_SOURCE_FLEXPWM3_WRITE2;
-          break;
-        case M(3, 3):
-          dma_source = DMAMUX_SOURCE_FLEXPWM3_WRITE3;
-          break;
-        case M(4, 0):
-          dma_source = DMAMUX_SOURCE_FLEXPWM4_WRITE0;
-          break;
-        case M(4, 1):
-          dma_source = DMAMUX_SOURCE_FLEXPWM4_WRITE1;
-          break;
-        case M(4, 2):
-          dma_source = DMAMUX_SOURCE_FLEXPWM4_WRITE2;
-          break;
-        case M(4, 3):
-          dma_source = DMAMUX_SOURCE_FLEXPWM4_WRITE3;
-          break;
-      }
-      if (dma_source == 255) return DShotError_NoSource;  // Doesn't match a known DMA source from FlexPWM
-
-      dma_channels[submodule] = new DMAChannel();
-
-      if (!dma_channels[submodule]) return DShotError_NoDMAAvailable;  // Your out of DMA Channels
-
-      dma_channels[submodule]->sourceBuffer(dma_data[submodule], sizeof(dma_data[submodule]));
-      dma_channels[submodule]->destination((uint16_t &)flexpwm->SM[submodule].VAL0); 
-      dma_channels[submodule]->triggerAtHardwareEvent(dma_source);
-      dma_channels[submodule]->interruptAtCompletion();
-      dma_channels[submodule]->attachInterrupt(dma_isr[submodule]);
-      dma_channels[submodule]->enable();
-      
+    DMAChannel *dma = new DMAChannel();
+    if (dma->TCD == nullptr) {  // DMAChannel couldn't allocate a hardware channel
+      delete dma;               // Nothing claimed yet, so a later retry starts clean
+      return DShotError_NoDMAAvailable;
     }
+    dma_channels[sm_index] = dma;
 
-    if (flexpwm == nullptr) {
-      return DShotError_Error;  // Checker, should never happen
-    }
+    flexpwmFrequency(flexpwm, submodule, sm_index, dshot_freq);
 
-    // Channel configuration and pin tracking
-    if(info->channel == 0) {
-      if(submodule_pins[submodule].pinX != 255) return DShotError_ChannelUsed;  // Channel X already used by another pin
-      else {
-        submodule_pins[submodule].pinX = pin;
-        flexpwm->OUTEN |= FLEXPWM_OUTEN_PWMX_EN(mask);
-      }
-    } else if(info->channel == 1)
-      if(submodule_pins[submodule].pinA != 255) return DShotError_ChannelUsed;  // Channel A already used by another pin
-      else {
-        submodule_pins[submodule].pinA = pin;
-        flexpwm->OUTEN |= FLEXPWM_OUTEN_PWMA_EN(mask);
-      }
-    } else if(info->channel == 2) {
-      if(submodule_pins[submodule].pinB != 255) return DShotError_ChannelUsed;  // Channel B already used by another pin
-      else {
-        submodule_pins[submodule].pinB = pin;
-        flexpwm->OUTEN |= FLEXPWM_OUTEN_PWMB_EN(mask);
-      }
-    }
+    dmaReset(sm_index);
+    dma->triggerAtHardwareEvent(dma_sources[sm_index]);
+    dma->interruptAtCompletion();
+    dma->attachInterrupt(dma_isr[sm_index]);
+    dma->enable();
 
-    pinMode(pin, OUTPUT);
-    *(portConfigRegister(pin)) = info->muxval;
-
-    return DShotError_Success;  // DShot capable
+    flexpwm_submodules |= M(flex_module, submodule);  // Only claim once setup has fully succeeded
   }
-  return DShotError_NotFlexPWM;  // Not DShot capable (QuadTimer)
+
+  // Channel configuration and pin tracking
+  *channel_pin = pin;
+  switch (info->channel) {
+    case 0: flexpwm->OUTEN |= FLEXPWM_OUTEN_PWMX_EN(mask); break;
+    case 1: flexpwm->OUTEN |= FLEXPWM_OUTEN_PWMA_EN(mask); break;
+    case 2: flexpwm->OUTEN |= FLEXPWM_OUTEN_PWMB_EN(mask); break;
+  }
+
+  pinMode(pin, OUTPUT);
+  *(portConfigRegister(pin)) = info->muxval;
+
+  return DShotError_Success;  // DShot capable
 }
 
 // Inspired by pwm.c : flexpwmFrequency(IMXRT_FLEXPWM_t *p, unsigned int submodule, uint8_t channel __attribute__((unused)), float frequency)
-void flexpwmFrequency(IMXRT_FLEXPWM_t *p, unsigned int submodule, uint8_t channel, float frequency) {
-  //Serial.println("flexpwmFrequency()");
+static void flexpwmFrequency(IMXRT_FLEXPWM_t *p, unsigned int submodule, unsigned int sm_index, float frequency) {
   uint16_t mask = 1 << submodule;
   uint32_t newdiv = (uint32_t)((float)F_BUS_ACTUAL / frequency + 0.5f);
 
-  //Serial.printf(" div=%lu, scale=%lu\n", newdiv, 1);
   p->MCTRL |= FLEXPWM_MCTRL_CLDOK(mask);
   p->SM[submodule].CTRL = FLEXPWM_SMCTRL_FULL;  // | FLEXPWM_SMCTRL_PRSC(7);
-  p->SM[submodule].VAL0 = 0;  // X module
+  p->SM[submodule].VAL0 = newdiv - 1;  // X module (high from VAL0 to VAL1, so VAL0 = VAL1 is low)
   p->SM[submodule].VAL1 = newdiv - 1;
-  p->SM[submodule].VAL2 = 0;  // For edge aligned
-  p->SM[submodule].VAL3 = 0;  // A module
-  p->SM[submodule].VAL4 = 0;  // For edge aligned
-  p->SM[submodule].VAL5 = 0;  // B module
+  p->SM[submodule].VAL2 = 0;  // A rising edge (edge aligned)
+  p->SM[submodule].VAL3 = 0;  // A falling edge
+  p->SM[submodule].VAL4 = 0;  // B rising edge (edge aligned)
+  p->SM[submodule].VAL5 = 0;  // B falling edge
   p->MCTRL |= FLEXPWM_MCTRL_LDOK(mask);
   p->SM[submodule].DMAEN = FLEXPWM_SMDMAEN_VALDE;
 
+  // Idle (low) values for every bit slot and every channel
   for (int i = 0; i < DATA_LENGTH; i++) {
-    dma_data[submodule][i].VAL0 = newdiv - 1;
-    dma_data[submodule][i].VAL1 = newdiv - 1;
+    dma_data[sm_index][i] = flexpwm_buffer();
+    dma_data[sm_index][i].VAL0 = newdiv - 1;
+    dma_data[sm_index][i].VAL1 = newdiv - 1;
   }
 }
 
 
 // Inspired by pwm.c : void analogWrite(uint8_t pin, int val)
 int sendDSHOT(uint8_t pin, uint16_t throttle, bool telemetry) {
-  //Serial.println("sendDSHOT()");
   if (pin >= CORE_NUM_DIGITAL) return DShotError_NotAPin;
 
   if (((dma_pins >> pin) & 1) == 0) {
     int error = dshotInit(pin);
     if (error > 0) return error;
-    dma_pins |= 1 << pin;
+    dma_pins |= 1ULL << pin;  // 64-bit shift: pins >= 32 exist on Teensy 4.1 / MicroMod
   }
 
-  //Serial.printf("sendDSHOT, pin %d, throttle %d, telemetry %c\n", pin, throttle, telemetry ? 'T' : 'F');
+  const struct pwm_pin_info_struct *info = &pwm_pin_info[pin];
+  if (info->type != 1) return DShotError_NotFlexPWM;
 
-  const struct pwm_pin_info_struct *info;
-  info = pwm_pin_info[pin];
-  
-  unsigned int submodule = _SM(info->flex_module);
-  unsigned int flex_module = _FM(info->flex_module);
-  unsigned int channel = info->channel;
+  const unsigned int sm_index = info->flex_module;
+  const unsigned int submodule = _SM(sm_index);
+  IMXRT_FLEXPWM_t *flexpwm = flexpwmModule(_FM(sm_index));
+  const uint16_t sm_bit = 1 << sm_index;
 
-  if (info->type == 1) {
-    // FlexPWM pin
-    uint16_t data = (constrain(throttle, 0, DSHOT_THROTTLE_MAX) << 5) | (telemetry << 4);
-    data |= ((data >> 4) ^ (data >> 8) ^ (data >> 12)) & 0x0f;
+  uint16_t data = (constrain(throttle, 0, DSHOT_THROTTLE_MAX) << 5) | (telemetry << 4);
+  data |= ((data >> 4) ^ (data >> 8) ^ (data >> 12)) & 0x0f;
 
-    IMXRT_FLEXPWM_t *flexpwm;
-    
-    if constexpr (flex_module == 1) flexpwm = &IMXRT_FLEXPWM1;
-    else if constexpr (flex_module == 2) flexpwm = &IMXRT_FLEXPWM2;
-    else if constexpr (flex_module == 3) flexpwm = &IMXRT_FLEXPWM3;
-    else if constexpr (flex_module == 4) flexpwm = &IMXRT_FLEXPWM4;
-    else return DShotError_Error;  // Invalid module, should never happen
+  // Wait for any frame in flight on this submodule (it may belong to another pin sharing it)
+  elapsedMicros waited;
+  while ((busy_submodules & sm_bit) && waited < BUSY_TIMEOUT_US) {}
+  if (busy_submodules & sm_bit) {  // ISR never fired: stop the submodule and recover
+    flexpwm->MCTRL &= ~FLEXPWM_MCTRL_RUN(1 << submodule);
+    dma_channels[sm_index]->clearComplete();
+    busy_submodules &= ~sm_bit;
+  }
 
-    uint32_t bit_length = flexpwm->SM[submodule].VAL1;
+  const uint32_t bit_length = flexpwm->SM[submodule].VAL1;
 
-    if (info->channel == 0) {  // X : inverted need to zero because we will flip later.
-      for (int i = 0; i < 16; i++) {
-        uint32_t offset = (data >> i) & 1;
-        dma_data[submodule][i].VAL0 = bit_length - (bit_length * 3) >> (3 - offset);
-      }
-    } else if (info->channel == 1) {  // A : rising edge
-      for (int i = 0; i < 16; i++) {
-        uint32_t offset = (data >> i) & 1;
-        dma_data[submodule][i].VAL2 = (bit_length * 3) >> (3 - offset);
-      }
-    } else if (info->channel == 2) {  // B : rising edge
-      for (int i = 0; i < 16; i++) {
-        uint32_t offset = (data >> i) & 1;
-        dma_data[submodule][i].VAL4 = (bit_length * 3) >> (3 - offset);
-      }
+  // MSB first, in slots 2..17. High time: 3/8 (37.5%) of a bit for a 0, 3/4 (75%) for a 1.
+  for (int i = 0; i < 16; i++) {
+    const uint32_t offset = (data >> i) & 1;
+    const uint16_t high = (bit_length * 3) >> (3 - offset);
+    flexpwm_buffer &slot = dma_data[sm_index][DATA_LENGTH - 3 - i];
+    switch (info->channel) {
+      case 0: slot.VAL0 = bit_length - high; break;  // X : high from VAL0 to VAL1 (inverted)
+      case 1: slot.VAL2 = 0; slot.VAL3 = high; break; // A : rise at VAL2, fall at VAL3
+      case 2: slot.VAL4 = 0; slot.VAL5 = high; break; // B : rise at VAL4, fall at VAL5
     }
-
-    flexpwm->MCTRL |= FLEXPWM_MCTRL_RUN(1 << submodule);
-
-    return DShotError_Success;
   }
-  return DShotError_NotFlexPWM;
+
+  // Note: other pins on the same submodule resend their last frame alongside this one.
+
+  // Restart the DMA from the start of the buffer and the counter from INIT so the frame begins cleanly
+  dmaReset(sm_index);
+  flexpwm->SM[submodule].CTRL2 |= FLEXPWM_SMCTRL2_FRCEN;
+  flexpwm->SM[submodule].CTRL2 |= FLEXPWM_SMCTRL2_FORCE;
+
+  // TODO(LDOK): LDOK is only set once in flexpwmFrequency(). Verify on a scope that each DMA write to
+  // VAL0..VAL5 is loaded every PWM period (FlexPWM VALDE DMA) without re-setting LDOK; not changed here.
+  busy_submodules |= sm_bit;
+  flexpwm->MCTRL |= FLEXPWM_MCTRL_RUN(1 << submodule);
+
+  return DShotError_Success;
 }
 
 template<uint8_t submodule_number>
 static void ISR() {
-  //Serial.print("ISR() : ");
-  //Serial.println(pin);
-
-  const struct pwm_pin_info_struct *info;
-  info = pwm_pin_info[pin];
-
   constexpr unsigned int submodule = _SM(submodule_number);
-  constexpr unsigned int flex_module = _FM(submodule_number);
+  IMXRT_FLEXPWM_t *flexpwm = flexpwmModule(_FM(submodule_number));
 
-  IMXRT_FLEXPWM_t *flexpwm;
-  
-  if constexpr (flex_module == 1) flexpwm = &IMXRT_FLEXPWM1;
-  else if constexpr (flex_module == 2) flexpwm = &IMXRT_FLEXPWM2;
-  else if constexpr (flex_module == 3) flexpwm = &IMXRT_FLEXPWM3;
-  else if constexpr (flex_module == 4) flexpwm = &IMXRT_FLEXPWM4;
-  else return;  // Invalid module, should never happen
-
-  flexpwm->MCTRL &= FLEXPWM_MCTRL_RUN(~(1 << submodule));
-  dma_channels[submodule]->clearInterrupt();
+  flexpwm->MCTRL &= ~FLEXPWM_MCTRL_RUN(1 << submodule);  // Clear only this submodule's RUN bit
+  dma_channels[submodule_number]->clearInterrupt();
+  busy_submodules &= ~(1 << submodule_number);
+  asm("DSB");
 }
