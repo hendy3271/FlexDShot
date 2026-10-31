@@ -165,8 +165,6 @@ static void (*const dma_isr[CORE_NUM_DIGITAL])() = { ISR<0>, ISR<1>, ISR<2>, ISR
                                         ISR<10>, ISR<11>, ISR<12>, ISR<13>, ISR<14>, ISR<15>, ISR<16>, ISR<17>, ISR<18>, ISR<19>,
                                         ISR<20>, ISR<21>, ISR<22>, ISR<23>, ISR<24>, ISR<25>, ISR<26>, ISR<27>, ISR<28>, ISR<29>,
                                         ISR<30>, ISR<31>, ISR<32>, ISR<33>, ISR<34>, ISR<35>, ISR<36>, ISR<37>, ISR<38>, ISR<39> };
-#endif
-
 #else
 #error Unsupported IMXRT1062 board (expected Teensy 4.0, 4.1 or MicroMod)
 #endif
@@ -300,7 +298,7 @@ static int dshotInit(uint8_t pin)  // Returns whether the pin is DShot capable (
     if (dma_source == 255) return DShotError_NoSource;  // Doesn't match a known DMA source from FlexPWM
 
     DMAChannel *dma = new DMAChannel();
-    if (dma->channel >= DMA_MAX_CHANNELS) {  // DMAChannel couldn't allocate a hardware channel
+    if (dma->TCD == nullptr) {  // DMAChannel couldn't allocate a hardware channel
       delete dma;                            // Nothing has been claimed yet, so a later retry starts clean
       return DShotError_NoDMAAvailable;
     }
