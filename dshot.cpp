@@ -5,7 +5,7 @@
 #error THIS MODULE ONLY WORKS WITH TEENSY 4.0 AND 4.1
 #endif
 
-void flexpwmFrequency(IMXRT_FLEXPWM_t *p, unsigned int submodule, uint8_t channel, float frequency);
+static void flexpwmFrequency(IMXRT_FLEXPWM_t *p, unsigned int submodule, uint8_t channel, float frequency);
 
 template<uint8_t pin> static void ISR();
 
@@ -25,7 +25,7 @@ struct pwm_pin_info_struct {
 
 #if defined(__IMXRT1062__)
 
-const struct pwm_pin_info_struct pwm_pin_info[] = {
+static const struct pwm_pin_info_struct pwm_pin_info[] = {
   { 1, M(1, 1), 0, 4 },  // FlexPWM1_1_X   0  // AD_B0_03
   { 1, M(1, 0), 0, 4 },  // FlexPWM1_0_X   1  // AD_B0_02
   { 1, M(4, 2), 1, 1 },  // FlexPWM4_2_A   2  // EMC_04
@@ -147,32 +147,41 @@ const struct pwm_pin_info_struct pwm_pin_info[] = {
 
 // End direct copy of pwm.c
 
-#ifdef ARDUINO_TEENSY41
-void (*dma_isr[CORE_NUM_DIGITAL])() = { ISR<0>, ISR<1>, ISR<2>, ISR<3>, ISR<4>, ISR<5>, ISR<6>, ISR<7>, ISR<8>, ISR<9>,
+#if defined(ARDUINO_TEENSY41)
+static void (*const dma_isr[CORE_NUM_DIGITAL])() = { ISR<0>, ISR<1>, ISR<2>, ISR<3>, ISR<4>, ISR<5>, ISR<6>, ISR<7>, ISR<8>, ISR<9>,
                                         ISR<10>, ISR<11>, ISR<12>, ISR<13>, ISR<14>, ISR<15>, ISR<16>, ISR<17>, ISR<18>, ISR<19>,
                                         ISR<20>, ISR<21>, ISR<22>, ISR<23>, ISR<24>, ISR<25>, ISR<26>, ISR<27>, ISR<28>, ISR<29>,
                                         ISR<30>, ISR<31>, ISR<32>, ISR<33>, ISR<34>, ISR<35>, ISR<36>, ISR<37>, ISR<38>, ISR<39>,
                                         ISR<40>, ISR<41>, ISR<42>, ISR<43>, ISR<44>, ISR<45>, ISR<46>, ISR<47>, ISR<48>, ISR<49>,
                                         ISR<50>, ISR<51>, ISR<52>, ISR<53>, ISR<54> };
-#endif
-
-#ifdef ARDUINO_TEENSY40
-void (*dma_isr[CORE_NUM_DIGITAL])() = { ISR<0>, ISR<1>, ISR<2>, ISR<3>, ISR<4>, ISR<5>, ISR<6>, ISR<7>, ISR<8>, ISR<9>,
+#elif defined(ARDUINO_TEENSY_MICROMOD)
+static void (*const dma_isr[CORE_NUM_DIGITAL])() = { ISR<0>, ISR<1>, ISR<2>, ISR<3>, ISR<4>, ISR<5>, ISR<6>, ISR<7>, ISR<8>, ISR<9>,
+                                        ISR<10>, ISR<11>, ISR<12>, ISR<13>, ISR<14>, ISR<15>, ISR<16>, ISR<17>, ISR<18>, ISR<19>,
+                                        ISR<20>, ISR<21>, ISR<22>, ISR<23>, ISR<24>, ISR<25>, ISR<26>, ISR<27>, ISR<28>, ISR<29>,
+                                        ISR<30>, ISR<31>, ISR<32>, ISR<33>, ISR<34>, ISR<35>, ISR<36>, ISR<37>, ISR<38>, ISR<39>,
+                                        ISR<40>, ISR<41>, ISR<42>, ISR<43>, ISR<44>, ISR<45> };
+#elif defined(ARDUINO_TEENSY40)
+static void (*const dma_isr[CORE_NUM_DIGITAL])() = { ISR<0>, ISR<1>, ISR<2>, ISR<3>, ISR<4>, ISR<5>, ISR<6>, ISR<7>, ISR<8>, ISR<9>,
                                         ISR<10>, ISR<11>, ISR<12>, ISR<13>, ISR<14>, ISR<15>, ISR<16>, ISR<17>, ISR<18>, ISR<19>,
                                         ISR<20>, ISR<21>, ISR<22>, ISR<23>, ISR<24>, ISR<25>, ISR<26>, ISR<27>, ISR<28>, ISR<29>,
                                         ISR<30>, ISR<31>, ISR<32>, ISR<33>, ISR<34>, ISR<35>, ISR<36>, ISR<37>, ISR<38>, ISR<39> };
 #endif
 
-const float dshotFreq[DShotType_Count] = { 150'000, 300'000, 600'000, 1'200'000 };
+#else
+#error Unsupported IMXRT1062 board (expected Teensy 4.0, 4.1 or MicroMod)
+#endif
 
-const uint16_t DATA_LENGTH = 20;
+static const float dshotFreq[DShotType_Count] = { 150'000, 300'000, 600'000, 1'200'000 };
 
+static const uint16_t DATA_LENGTH = 20;
+static const uint32_t BUSY_TIMEOUT_US = 1000;  // Longest frame (DShot150, 20 bits) is ~133us
 
-DMAChannel *dma_channels[CORE_NUM_DIGITAL] = { nullptr };
-uint16_t dma_data[CORE_NUM_DIGITAL][DATA_LENGTH] = {};
-float dshot_freq = dshotFreq[DShot150];
-uint64_t dma_pins = 0;            // "Bit array" for pin tracking
-uint16_t flexpwm_submodules = 0;  // "Bit array" for submodule tracking (1 << (submodule + 4*module))
+static DMAChannel *dma_channels[CORE_NUM_DIGITAL] = { nullptr };
+static uint16_t dma_data[CORE_NUM_DIGITAL][DATA_LENGTH] = {};
+static float dshot_freq = dshotFreq[DShot150];
+static uint64_t dma_pins = 0;                // "Bit array" for pin tracking
+static volatile uint64_t busy_pins = 0;      // "Bit array" of pins with a frame in flight (cleared in ISR)
+static uint16_t flexpwm_submodules = 0;  // "Bit array" for submodule tracking (1 << (submodule + 4*module))
 
 float dshotFrequency() {
   //Serial.println("dshotFrequency()");
@@ -188,7 +197,7 @@ float dshotFrequency(uint8_t dshot_speed) {
 }
 
 // Inspired by pwm.c : void analogWriteFrequency(uint8_t pin, float frequency)
-int dshotInit(uint8_t pin)  // Returns whether the pin is DShot capable (ie FlexPWM)
+static int dshotInit(uint8_t pin)  // Returns whether the pin is DShot capable (ie FlexPWM)
 {
   //Serial.println("dshotInit()");
   const struct pwm_pin_info_struct *info;
@@ -208,7 +217,7 @@ int dshotInit(uint8_t pin)  // Returns whether the pin is DShot capable (ie Flex
     if (((flexpwm_submodules >> (submodule + 4 * flex_module)) & 1) != 0) {  // Can't have two pins on the same submodule
       return DShotError_SubmoduleUsed;
     }
-    flexpwm_submodules |= 1 << (submodule + 4 * flex_module);
+    const uint16_t submodule_bit = 1 << (submodule + 4 * flex_module);
 
     IMXRT_FLEXPWM_t *flexpwm;
     switch (flex_module) {
@@ -290,9 +299,12 @@ int dshotInit(uint8_t pin)  // Returns whether the pin is DShot capable (ie Flex
     }
     if (dma_source == 255) return DShotError_NoSource;  // Doesn't match a known DMA source from FlexPWM
 
-    dma_channels[pin] = new DMAChannel();
-
-    if (!dma_channels[pin]) return DShotError_NoDMAAvailable;  // Your out of DMA Channels
+    DMAChannel *dma = new DMAChannel();
+    if (dma->channel >= DMA_MAX_CHANNELS) {  // DMAChannel couldn't allocate a hardware channel
+      delete dma;                            // Nothing has been claimed yet, so a later retry starts clean
+      return DShotError_NoDMAAvailable;
+    }
+    dma_channels[pin] = dma;
 
     dma_channels[pin]->sourceBuffer(dma_data[pin], sizeof(dma_data[pin]));
 
@@ -314,13 +326,14 @@ int dshotInit(uint8_t pin)  // Returns whether the pin is DShot capable (ie Flex
     dma_channels[pin]->attachInterrupt(dma_isr[pin]);
     dma_channels[pin]->enable();
 
+    flexpwm_submodules |= submodule_bit;  // Only claim the submodule once setup has fully succeeded
     return DShotError_Success;  // DShot capable
   }
   return DShotError_NotFlexPWM;  // Not DShot capable (QuadTimer)
 }
 
 // Inspired by pwm.c : flexpwmFrequency(IMXRT_FLEXPWM_t *p, unsigned int submodule, uint8_t channel __attribute__((unused)), float frequency)
-void flexpwmFrequency(IMXRT_FLEXPWM_t *p, unsigned int submodule, uint8_t channel, float frequency) {
+static void flexpwmFrequency(IMXRT_FLEXPWM_t *p, unsigned int submodule, uint8_t channel, float frequency) {
   //Serial.println("flexpwmFrequency()");
   uint16_t mask = 1 << submodule;
   uint32_t newdiv = (uint32_t)((float)F_BUS_ACTUAL / frequency + 0.5f);
