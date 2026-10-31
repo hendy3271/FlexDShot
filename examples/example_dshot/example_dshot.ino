@@ -22,14 +22,17 @@ void setup() {
       case DShotError_NotFlexPWM:
         Serial.println("FAILED -> This pin is not a FlexPWM pin!");
         break;
-      case DShotError_SubmoduleUsed:
-        Serial.println("FAILED -> Submodule already in use!");
+      case DShotError_ChannelUsed:
+        Serial.println("FAILED -> FlexPWM channel already in use by another pin!");
         break;
       case DShotError_NoSource:
         Serial.println("FAILED -> Unknown DMA Source!");
         break;
       case DShotError_NoDMAAvailable:
         Serial.println("FAILED -> No more DMA channels available!");
+        break;
+      case DShotError_Error:
+        Serial.println("FAILED -> Internal error!");
         break;
       default:
         Serial.println("FAILED -> Unknown error!");
@@ -60,13 +63,11 @@ void loop() {
     while (Serial.available()) Serial.read();
   }
 
-  // Move the throttle towards the target
-  if (throttle_target != 0 && throttle < THROTTLE_MIN) throttle = THROTTLE_MIN;
+  /*// Move the throttle towards the target
   if (throttle < throttle_target) throttle++;
   if (throttle > throttle_target) throttle--;
-
-  // Type 0 to stop the motors
-  if (throttle_target == 0) throttle = 0;
+  */
+  throttle = throttle_target;  // throttle_target is always 0 (stop) or 48-2047, never a command value
 
   // Send new throttles
   for (unsigned int i = 0; i < pin_number; i++) {

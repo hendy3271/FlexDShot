@@ -1,8 +1,10 @@
-# FlexDShot
+# FlexPWM DShot (FlexDShot)
 
-An Arduino library for **Teensy 4.0 / 4.1 / MicroMod** (NXP i.MX RT1062) that sends **DShot** throttle frames to ESCs using the chip's **FlexPWM** hardware and **DMA**.
+https://github.com/hendy3271/FlexDShot
 
-Each frame is produced in hardware: the library fills a small buffer with one PWM duty value per bit and a DMA channel writes those values into the FlexPWM compare register on every PWM period. The CPU only builds the 16-bit frame; it does not bit-bang the output.
+An Arduino library for **Teensy 4.0 / 4.1 / MicroMod** (NXP i.MX RT1062) that sends **DShot** throttle frames to ESCs using the chip's **FlexPWM** hardware and **DMA**. Receiving data is not available.
+
+Each frame is produced in hardware: the library fills a small buffer with one set of PWM compare values per bit, and a DMA channel writes them into the FlexPWM submodule's registers on every PWM period. The CPU only builds the 16-bit frame; it does not bit-bang the output.
 
 > Send-only. This library transmits DShot frames. It does not read ESC telemetry (no bidirectional DShot / eRPM, no telemetry UART).
 
@@ -11,7 +13,7 @@ Each frame is produced in hardware: the library fills a small buffer with one PW
 - DShot150, DShot300, DShot600 and DShot1200 (one speed for all pins, chosen before the first send)
 - 11-bit throttle value (0–2047) plus the telemetry-request bit
 - Standard 4-bit DShot checksum computed for you
-- One DMA channel per pin, so several motors can be driven independently
+- One DMA channel per FlexPWM submodule, shared by the X, A and B pins on that submodule, so several motors can be driven at once
 - Works on FlexPWM channels A, B and X (X outputs are handled with inverted compare values)
 - Pins are set up automatically the first time you send to them
 
@@ -28,7 +30,7 @@ Each frame is produced in hardware: the library fills a small buffer with one PW
 
 Only pins wired to a **FlexPWM** submodule work. QuadTimer PWM pins (10, 11, 12, 13, 14, 15, 18, 19) return `DShotError_NotFlexPWM`.
 
-Only **one pin per FlexPWM submodule** can be used at a time, because each pin's timing runs off its submodule's counter. Pins that share a submodule are grouped below; pick at most one from each row.
+Pins that share a FlexPWM submodule can be used together **as long as they're on different channels** (X, A or B); each submodule has one of each. Two pins on the same channel return `DShotError_ChannelUsed`. Pins on one submodule share one counter and one DMA transfer, so sending to one of them also resends the last frame of the others on that submodule (see *Limitations*). Shared-submodule support is new and hasn't been tested on hardware yet.
 
 | FlexPWM submodule | Teensy 4.0 pins | Teensy 4.1 pins |
 |---|---|---|
@@ -47,7 +49,7 @@ Only **one pin per FlexPWM submodule** can be used at a time, because each pin's
 | FlexPWM4_1 | 23 | 23 |
 | FlexPWM4_2 | 2, 3 | 2, 3 |
 
-That gives up to 12 independent DShot outputs on a Teensy 4.0 and 14 on a Teensy 4.1.
+Pins in the same row share a submodule. For fully independent outputs, pick one pin per row.
 A good four-motor set is pins **2, 4, 5, 6** or **3, 4, 5, 6** (used by the example).
 
 Because DShot takes over a pin's FlexPWM submodule, don't use `analogWrite()` on any other pin that shares that submodule.
@@ -126,7 +128,7 @@ Returns the current bit rate in bits/s. Default is DShot150 (150000).
 
 ### `int sendDSHOT(uint8_t pin, uint16_t throttle = 0, bool telemetry = false)`
 
-Sends one DShot frame on `pin`. The first call for a pin configures its FlexPWM submodule and a DMA channel. If the previous frame on that pin is still going out, the call waits for it to finish (up to 1 ms) before starting the new one.
+Sends one DShot frame on `pin`. The first call for a pin configures its FlexPWM submodule and a DMA channel. If the previous frame on that pin's submodule (from this pin or another pin sharing it) is still going out, the call waits for it to finish (up to 1 ms) before starting the new one.
 
 - `throttle`: 0–2047, clamped to `DSHOT_THROTTLE_MAX` (2047). By the DShot convention, 0 is disarmed/stop, 1–47 are ESC commands, and 48–2047 is throttle. The library sends the value as-is; it doesn't treat commands specially.
 - `telemetry`: sets the telemetry-request bit in the frame. The library doesn't read the reply.
@@ -138,7 +140,8 @@ Returns a `DShotError` value:
 | `DShotError_Success` | Frame started |
 | `DShotError_NotAPin` | Pin number out of range |
 | `DShotError_NotFlexPWM` | Pin isn't a FlexPWM pin (e.g. a QuadTimer pin) |
-| `DShotError_SubmoduleUsed` | Another pin already uses this FlexPWM submodule |
+| `DShotError_Error` | Internal error (shouldn't happen) |
+| `DShotError_ChannelUsed` | Another pin already uses this FlexPWM channel (same submodule and same X/A/B channel) |
 | `DShotError_NoSource` | No DMA request source for this submodule |
 | `DShotError_NoDMAAvailable` | Couldn't get a DMA channel (nothing is claimed, so you can retry later) |
 
@@ -152,13 +155,14 @@ Returns a `DShotError` value:
 - The FlexPWM submodule period is set to one DShot bit time (`F_BUS / bit rate`; at 150 MHz that's 1000 counts for DShot150 and 125 for DShot1200).
 - Each bit is one PWM period: a `1` is high for 75% of the period, a `0` for 37.5%.
 - The frame is `throttle(11) | telemetry(1) | crc(4)`, with `crc = (v ^ v>>4 ^ v>>8) & 0xF` over the 12-bit value, sent most significant bit first.
-- 20 values are sent per frame: a short low lead-in, the 16 data bits, and low trailing slots. A DMA-completion interrupt stops the submodule after the frame.
+- 20 sets of compare values (VAL0–VAL5) are sent per frame: a short low lead-in, the 16 data bits, and low trailing slots. A DMA-completion interrupt stops the submodule after the frame.
 
 ## Limitations
 
 - Send-only: no bidirectional DShot, eRPM or telemetry reading.
 - One DShot speed for all pins, fixed after the first send. There's no way to release a pin.
-- One pin per FlexPWM submodule; QuadTimer pins aren't supported.
+- QuadTimer pins aren't supported.
+- Pins sharing a submodule are sent together: sending to one pin repeats the other pins' last frames, and they can't be timed independently.
 - No helper for DShot commands (beeps, spin direction, save settings, …). You can send the raw command value, but you must repeat it yourself and set the telemetry bit where the ESC firmware needs it.
 - `sendDSHOT()` blocks briefly if the previous frame on the same pin hasn't finished (a frame takes about 133 µs at DShot150 and 33 µs at DShot600).
 
